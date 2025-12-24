@@ -39,20 +39,8 @@ def predict_file(
         "max_proba": float(np.max(proba)) if len(proba) else 0.0,
     }
 
-    # Pass through selected physiological metrics per window for visualization
-    phys_cols = [
-        "hr_mean",
-        "hr_std",
-        "rr_std",
-        "ppg_hr_mean",
-        "resp_rate_ecg",
-        "resp_rate_ppg",
-        "spo2_mean",
-    ]
-    phys_df = pd.DataFrame()
-    for col in phys_cols:
-        if col in feat_df.columns:
-            phys_df[col] = feat_df[col]
+    # Pass through all numeric metrics per window for visualization
+    phys_df = feat_df.select_dtypes(include=["number"]).copy()
     result["phys_metrics"] = phys_df.to_dict(orient="list") if not phys_df.empty else {}
 
     # Mark intervals of likely lie

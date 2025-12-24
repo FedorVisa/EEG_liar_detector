@@ -33,7 +33,7 @@ class LieDetectorApp(QtWidgets.QMainWindow):
         # Controls
         controls = QtWidgets.QHBoxLayout()
         self.path_edit = QtWidgets.QLineEdit()
-        browse_btn = QtWidgets.QPushButton("Выбрать bcrx")
+        browse_btn = QtWidgets.QPushButton("Выбрать файл")
         browse_btn.clicked.connect(self.browse_file)
         controls.addWidget(self.path_edit)
         controls.addWidget(browse_btn)
@@ -58,8 +58,10 @@ class LieDetectorApp(QtWidgets.QMainWindow):
 
         layout.addLayout(controls)
 
-        # Probability plot
-        self.plot = pg.PlotWidget(background="w")
+        # Probability plot with fixed SI prefixes (no Gs etc.)
+        axis_bottom = pg.AxisItem(orientation="bottom")
+        axis_bottom.enableAutoSIPrefix(False)
+        self.plot = pg.PlotWidget(background="w", axisItems={"bottom": axis_bottom})
         self.plot.setLabel("bottom", "Time", units="s")
         self.plot.setLabel("left", "P(ложь)")
         self._orig_plot_mouse = self.plot.mousePressEvent
@@ -77,14 +79,38 @@ class LieDetectorApp(QtWidgets.QMainWindow):
         prob_layout = QtWidgets.QVBoxLayout(prob_tab)
         self.table = QtWidgets.QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["Начало (с)", "Конец (с)", "P(ложь)"])
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         prob_layout.addWidget(self.table)
         self.tabs.addTab(prob_tab, "Вероятности")
 
         phys_tab = QtWidgets.QWidget()
         phys_layout = QtWidgets.QVBoxLayout(phys_tab)
+
+        # Metric selection list
+        self.metric_list = QtWidgets.QListWidget()
+        self.metric_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.metric_list.itemChanged.connect(self._on_metric_selection_changed)
+        phys_layout.addWidget(QtWidgets.QLabel("Показать метрики:"))
+        phys_layout.addWidget(self.metric_list, stretch=1)
+
+        self.toggle_desc_btn = QtWidgets.QPushButton("Показать описания")
+        self.toggle_desc_btn.setCheckable(True)
+        self.toggle_desc_btn.toggled.connect(self._on_toggle_desc)
+        phys_layout.addWidget(self.toggle_desc_btn)
+
+        self.metric_desc = QtWidgets.QLabel("")
+        self.metric_desc.setWordWrap(True)
+        self.metric_desc.setVisible(False)
+        phys_layout.addWidget(self.metric_desc)
+
         self.phys_table = QtWidgets.QTableWidget(0, 0)
         self.phys_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        phys_layout.addWidget(self.phys_table)
+        self.phys_table.setMinimumHeight(240)
+        self.phys_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.phys_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        phys_layout.addWidget(self.phys_table, stretch=2)
         self.tabs.addTab(phys_tab, "Характеристики")
 
         layout.addWidget(self.tabs, stretch=1)
@@ -92,14 +118,14 @@ class LieDetectorApp(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
 
     def browse_file(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Выберите bcrx", str(Path.cwd()), "*.bcrx *.csv")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Выберите файл", str(Path.cwd()), "*.bcrx *.csv")
         if path:
             self.path_edit.setText(path)
 
     def run_inference(self):
         path = self.path_edit.text().strip()
         if not path:
-            QtWidgets.QMessageBox.warning(self, "Нет файла", "Укажите путь к bcrx")
+            QtWidgets.QMessageBox.warning(self, "Нет файла", "Укажите путь к файлу с сигналом.")
             return
         self.window_sec = self.window_spin.value()
         self.step_sec = self.step_spin.value()
@@ -118,6 +144,7 @@ class LieDetectorApp(QtWidgets.QMainWindow):
 
         proba = result["proba_per_window"]
         intervals = result["lie_intervals"]
+        self._phys_cache = result.get("phys_metrics", {}) or {}
         # Update label
         agg = result.get("mean_proba", 0.0)
         self.result_label.setText(f"Средняя вероятность лжи: {agg:.2f}; максимум: {result.get('max_proba', 0):.2f}")
@@ -131,28 +158,10 @@ class LieDetectorApp(QtWidgets.QMainWindow):
         self.plot.setLabel("bottom", "Time", units="s")
         self.plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
         self.plot.setYRange(0, 1)
+        self._window_times = list(x)
 
-        # Phys metrics text
-        phys = result.get("phys_metrics", {}) or {}
-        if phys:
-            metrics = list(phys.keys())
-            n_rows = len(next(iter(phys.values()))) if phys else 0
-            self.phys_table.setColumnCount(len(metrics))
-            self.phys_table.setRowCount(n_rows)
-            self.phys_table.setHorizontalHeaderLabels(metrics)
-            for c, name in enumerate(metrics):
-                vals = phys.get(name, [])
-                for r, v in enumerate(vals):
-                    try:
-                        txt = f"{float(v):.2f}"
-                    except Exception:
-                        txt = str(v)
-                    self.phys_table.setItem(r, c, QtWidgets.QTableWidgetItem(txt))
-            self.phys_table.resizeColumnsToContents()
-        else:
-            self.phys_table.clear()
-            self.phys_table.setRowCount(0)
-            self.phys_table.setColumnCount(0)
+        # Fill metric selector and table
+        self._fill_metrics_ui()
 
         # Table
         self.table.setRowCount(len(intervals))
@@ -166,11 +175,121 @@ class LieDetectorApp(QtWidgets.QMainWindow):
         if not self.path_edit.text().strip():
             self.browse_file()
             return
+        # If data loaded, map click to nearest window and select row
+        if hasattr(self, "_window_times") and self._window_times:
+            try:
+                view_pos = self.plot.plotItem.vb.mapSceneToView(event.scenePos())
+                t = view_pos.x()
+                times = np.array(self._window_times)
+                idx = int(np.argmin(np.abs(times - t)))
+                self._select_window(idx)
+            except Exception:
+                pass
         # иначе передаем событие стандартному обработчику
         if self._orig_plot_mouse:
             self._orig_plot_mouse(event)
 
+    def _select_window(self, idx: int):
+        if idx < 0:
+            return
+        # Select in prob table
+        if self.table.rowCount() > idx:
+            self.table.setCurrentCell(idx, 0)
+            item = self.table.item(idx, 0)
+            if item:
+                self.table.scrollToItem(item, QtWidgets.QAbstractItemView.PositionAtCenter)
+        # Select in phys table
+        if self.phys_table.rowCount() > idx:
+            self.phys_table.setCurrentCell(idx, 0)
+            item = self.phys_table.item(idx, 0)
+            if item:
+                self.phys_table.scrollToItem(item, QtWidgets.QAbstractItemView.PositionAtCenter)
 
+    def _fill_metrics_ui(self):
+        phys = getattr(self, "_phys_cache", {}) or {}
+        self.metric_list.blockSignals(True)
+        self.metric_list.clear()
+        metrics = list(phys.keys())
+        for name in metrics:
+            item = QtWidgets.QListWidgetItem(name)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Checked)
+            self.metric_list.addItem(item)
+        self.metric_list.blockSignals(False)
+        self._update_phys_table()
+        self._update_metric_description()
+
+    def _on_metric_selection_changed(self, item):
+        self._update_phys_table()
+        self._update_metric_description()
+
+    def _on_toggle_desc(self, checked: bool):
+        self.metric_desc.setVisible(checked)
+        if checked:
+            self._update_metric_description()
+
+    def _selected_metrics(self):
+        selected = []
+        for i in range(self.metric_list.count()):
+            it = self.metric_list.item(i)
+            if it.checkState() == QtCore.Qt.Checked:
+                selected.append(it.text())
+        return selected
+
+    def _metric_description(self, name: str) -> str:
+        desc = {
+            "hr_mean": "Средняя ЧСС (уд/мин) по окну",
+            "hr_std": "Ст. отклонение ЧСС",
+            "rr_mean": "Средний RR-интервал (мс)",
+            "rr_std": "Ст. отклонение RR (мс)",
+            "rr_rmssd": "RMSSD вариабельности сердечного ритма",
+            "ppg_hr_mean": "Средняя ЧСС по пульсовым пикам (уд/мин)",
+            "ppg_hr_std": "Ст. отклонение ЧСС по пульсу",
+            "ppg_interval_std": "Ст. отклонение интервалов между пульсовыми пиками (мс)",
+            "ppg_amplitude_mean": "Средняя амплитуда пульсовой волны",
+            "ppg_amplitude_std": "Ст. отклонение амплитуды пульсовой волны",
+            "spo2_mean": "Средний SpO2 (%)",
+            "spo2_std": "Ст. отклонение SpO2",
+            "resp_rate_ecg": "Частота дыхания по ЭКГ (вдох/мин)",
+            "resp_rate_ppg": "Частота дыхания по ППГ (вдох/мин)",
+            "resp_rate_std_ecg": "Ст. отклонение частоты дыхания (ЭКГ)",
+            "resp_rate_std_ppg": "Ст. отклонение частоты дыхания (ППГ)",
+            "hrv_time_sdnn": "SDNN (вариабельность, мс)",
+            "hrv_time_rmssd": "RMSSD (вариабельность, мс)",
+            "hrv_freq_lf": "LF мощность HRV",
+            "hrv_freq_hf": "HF мощность HRV",
+        }
+        return desc.get(name, "Описание недоступно")
+
+    def _update_metric_description(self):
+        selected = self._selected_metrics()
+        if not selected:
+            self.metric_desc.setText("Описание: выберите метрики выше")
+            return
+        lines = [f"{name}: {self._metric_description(name)}" for name in selected]
+        self.metric_desc.setText("\n".join(lines))
+
+    def _update_phys_table(self):
+        phys = getattr(self, "_phys_cache", {}) or {}
+        selected = self._selected_metrics()
+        if not phys or not selected:
+            self.phys_table.clear()
+            self.phys_table.setRowCount(0)
+            self.phys_table.setColumnCount(0)
+            return
+        n_rows = len(next(iter(phys.values()))) if phys else 0
+        self.phys_table.setColumnCount(len(selected))
+        self.phys_table.setRowCount(n_rows)
+        self.phys_table.setHorizontalHeaderLabels(selected)
+        for c, name in enumerate(selected):
+            vals = phys.get(name, [])
+            for r, v in enumerate(vals):
+                try:
+                    txt = f"{float(v):.2f}"
+                except Exception:
+                    txt = str(v)
+                self.phys_table.setItem(r, c, QtWidgets.QTableWidgetItem(txt))
+        self.phys_table.resizeColumnsToContents()
 def main():
     app = QtWidgets.QApplication(sys.argv)
     model_dir = str(Path(__file__).resolve().parent / "artifacts")
